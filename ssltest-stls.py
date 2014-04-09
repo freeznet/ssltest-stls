@@ -18,6 +18,12 @@ options = OptionParser(usage='%prog server [options]', description='Test for SSL
 options.add_option('-p', '--port', type='int', default=443, help='TCP port to test (default: 443)')
 options.add_option('-s', '--starttls', type='string', default='', help='STARTTLS protocol: smtp, pop3, imap, ftp, or xmpp')
 
+DEBUG = False
+
+def debug_print(message):
+    if DEBUG:
+        print message
+
 def h2bin(x):
     return x.replace(' ', '').replace('\n', '').decode('hex')
 
@@ -49,8 +55,8 @@ def hexdump(s):
         lin = [c for c in s[b : b + 16]]
         hxdat = ' '.join('%02X' % ord(c) for c in lin)
         pdat = ''.join((c if 32 <= ord(c) <= 126 else '.' )for c in lin)
-        print '  %04x: %-48s %s' % (b, hxdat, pdat)
-    print
+        debug_print('  %04x: %-48s %s' % (b, hxdat, pdat))
+    debug_print('')
 
 def recvall(s, length, timeout=4):
     endtime = time.time() + timeout
@@ -74,14 +80,14 @@ def recvall(s, length, timeout=4):
 def recvmsg(s):
     hdr = recvall(s, 5)
     if hdr is None:
-        print 'Unexpected EOF receiving record header - server closed connection'
+        debug_print('Unexpected EOF receiving record header - server closed connection')
         return None, None, None
     typ, ver, ln = struct.unpack('>BHH', hdr)
     pay = recvall(s, ln, 10)
     if pay is None:
-        print 'Unexpected EOF receiving record payload - server closed connection'
+        debug_print('Unexpected EOF receiving record payload - server closed connection')
         return None, None, None
-    print ' ... received message: type = %d, ver = %04x, length = %d' % (typ, ver, len(pay))
+    debug_print(' ... received message: type = %d, ver = %04x, length = %d' % (typ, ver, len(pay)))
     return typ, ver, pay
 
 def hit_hb(s):
@@ -89,41 +95,52 @@ def hit_hb(s):
     while True:
         typ, ver, pay = recvmsg(s)
         if typ is None:
-            print 'No heartbeat response received, server likely not vulnerable'
+            debug_print('No heartbeat response received, server likely not vulnerable')
             return False
 
         if typ == 24:
-            print 'Received heartbeat response:'
-            hexdump(pay)
+            debug_print('Received heartbeat response:')
+            #hexdump(pay)
             if len(pay) > 3:
-                print 'WARNING: server returned more data than it should - server is vulnerable!'
+                debug_print('WARNING: server returned more data than it should - server is vulnerable!')
             else:
-                print 'Server processed malformed heartbeat, but did not return any extra data.'
+                debug_print('Server processed malformed heartbeat, but did not return any extra data.')
             return True
 
         if typ == 21:
-            print 'Received alert:'
+            debug_print('Received alert:')
             hexdump(pay)
-            print 'Server returned error, likely not vulnerable'
+            debug_print('Server returned error, likely not vulnerable')
             return False
 
 BUFSIZ = 1024
 
-def main():
+def parse_args():
     opts, args = options.parse_args()
 
     if len(args) < 1:
         options.print_help()
-        return
+        exit(0)
+    return (opts, args)
+
+def test(opts, args):
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(3)
 
-    print 'Connecting...'
+    debug_print('Connecting...')
 
-    s.connect((args[0], opts.port))
+    try:
+        s.connect((args[0], opts.port))
+    except socket.error:
+        print 'NOTHING: %s:%d' % (args[0], opts.port)
+        return False
 
     if opts.starttls != '':
-      print 'Sending STARTTLS Protocol Command...'
+      debug_print('Sending STARTTLS Protocol Command...')
+      proto = opts.starttls + ' + starttls'
+    else:
+      proto = 'ssl'
 
     if opts.starttls == 'smtp':
       s.recv(BUFSIZ)
@@ -151,25 +168,63 @@ def main():
       s.send("<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='%s' version='1.0'\n")
       s.recv(BUFSIZ)
 
-    print 'Sending Client Hello...'
+    debug_print('Sending Client Hello...')
 
     s.send(hello)
 
-    print 'Waiting for Server Hello...'
+    debug_print('Waiting for Server Hello...')
 
     while True:
         typ, ver, pay = recvmsg(s)
         if typ == None:
-            print 'Server closed connection without sending Server Hello.'
-            return
+            debug_print('Server closed connection without sending Server Hello.')
+            print 'INCOMPLETE: %s:%d %s' % (args[0], opts.port, proto)
+            s.close()
+            return True
         # Look for server hello done message.
         if typ == 22 and ord(pay[0]) == 0x0E:
             break
 
-    print 'Sending heartbeat request...'
+    debug_print('Sending heartbeat request...')
     sys.stdout.flush()
     s.send(hb)
-    hit_hb(s)
+    vulnerable = hit_hb(s)
+    s.close()
+    if vulnerable:
+        print 'VULNERABLE: %s:%d %s' % (args[0], opts.port, proto)
+    else:
+        print 'CLEAN: %s:%d %s' % (args[0], opts.port, proto)
+    return vulnerable
+
+class ScanHost():
+    def __init__(self, port, starttls=''):
+        self.port = port
+        self.starttls = starttls
+
+def main():
+    opts, args = parse_args()
+    if test(opts, args):
+        sys.exit(2)
+
+def get_targets():
+    return [
+            ScanHost(443), # https
+            ScanHost(465), # smtps
+            ScanHost(636), # ldaps
+            ScanHost(993), # imaps
+            ScanHost(995), # pop3s
+            ScanHost(21, 'ftp'),
+            ScanHost(25, 'smtp'),
+            ScanHost(110, 'pop3'),
+            ScanHost(143, 'imap'),
+            ScanHost(5222, 'xmpp')
+            ]
 
 if __name__ == '__main__':
-    main()
+    from multiprocessing import Pool
+    p = Pool(250)
+    for ip in range(0, 255):
+        for port in get_targets():
+            p.apply_async(test, [port, ['10.0.0.' + str(ip)]])
+    p.close()
+    p.join()
